@@ -1,125 +1,85 @@
-# Orders Service – SOLID Production Example (Spring Boot 4.0.2)
 
-This project demonstrates all SOLID principles in a production-like Spring Boot microservice.
+Принципы остаются теми же:
 
----
+- **OCP** — открытость для расширения: новый обработчик события добавляется без изменения основного кода
+- **DIP** — зависимость от абстракций (интерфейсов)
+- **Event-driven** (E из IDEALS) — асинхронное общение через события (теперь через Pulsar topics и subscriptions)
 
-# 1️⃣ SRP — Single Responsibility Principle
+### Сценарий остаётся тем же
 
-A class should have only one reason to change.
+Микросервис **Order Service** создаёт заказ → публикует событие `OrderCreatedEvent`.  
+Несколько независимых обработчиков реагируют:
 
-❌ Violation (GodService):
-- Handles validation
-- Payment call
-- Persistence
-- Email
-- Transaction management
+- Резервирование товара
+- Инициирование оплаты
+- Отправка уведомления
 
-If payment logic changes → service changes.
-If notification changes → service changes.
+Новый обработчик (например, начисление бонусов) добавляется просто новым классом.
 
-✅ Fix:
-- OrderService (orchestration)
-- PaymentPort
-- NotificationPort
-- Repository
-Each class changes for one reason only.
+### Структура проекта (упрощённо)
 
----
+```
+src/main/java/com/example/order
+├── config
+│   └── PulsarConfig.java          (если нужно кастомизировать)
+├── domain
+│   └── OrderCreatedEvent.java
+├── service
+│   ├── OrderService.java
+│   └── handlers
+│       ├── OrderEventHandler.java       // интерфейс (DIP + OCP)
+│       ├── InventoryReservationHandler.java
+│       ├── PaymentInitiationHandler.java
+│       └── NotificationHandler.java
+└── producer
+    └── OrderEventProducer.java
+```
 
-# 2️⃣ OCP — Open/Closed Principle
+### Как это реализует принципы
 
-Open for extension, closed for modification.
+- **DIP**: `OutboxProcessor` зависит от абстракции `OrderEventProducer`.  
+  `OrderEventConsumer` получает список интерфейсов `OrderEventHandler` через конструктор (Spring их собирает автоматически).
 
-❌ Violation:
-if(paymentType.equals("CARD")) {...}
-else if("PAYPAL") {...}
+- **OCP**: Новый обработчик — просто новый `@Component`, реализующий `OrderEventHandler`.  
+  Spring Boot + PulsarListener автоматически подхватывают все bean'ы. Ничего в `OrderService` или `OrderEventConsumer` менять не нужно.
 
-Adding new payment → modify existing class.
+- **Event-driven**: Полностью асинхронно через Pulsar.  
+  Преимущества Pulsar по сравнению с Kafka в этом сценарии:
+    - встроенная поддержка multi-tenancy и namespaces
+    - гибкие подписки (exclusive, shared, failover)
+    - tiered storage (можно хранить старые события дешево)
+    - Kafka-совместимый API (если нужно мигрировать позже)
 
-✅ Fix:
-PaymentStrategy interface
-Spring injects Map<String, PaymentStrategy>
-New payment = new bean. No modification.
+В production реализовано:
 
----
+- **Transactional outbox**: события сначала сохраняются в БД (таблица `outbox_events`) в одной транзакции с бизнес-логикой, а затем отдельный процесс `OutboxProcessor` отправляет их в Pulsar.
+- **Acknowledgment**: настроен `MANUAL` режим подтверждения. Если хотя бы один обработчик завершается с ошибкой, вызывается `nack()`, что инициирует повторную доставку.
+- **Dead-letter topics**: после 3 неудачных попыток событие отправляется в `order-created-dlq`.
+- **Schema evolution**: настроена стратегия `ALWAYS_COMPATIBLE` для обеспечения совместимости схем при изменениях.
+- **Tracing**: интегрированы Micrometer Tracing и OpenTelemetry (настроено через `application.yml` и зависимости в `pom.xml`).
 
-# 3️⃣ LSP — Liskov Substitution Principle
+В проект внесены следующие изменения для обеспечения надежности и наблюдаемости:
 
-Subtypes must preserve behavioral contracts.
+### 1. Transactional Outbox
+- Добавлена сущность `OutboxEvent` и репозиторий `OutboxRepository` (Spring Data JPA).
+- `OrderService` теперь сохраняет события в базу данных (H2) в рамках транзакции, вместо прямой отправки в Pulsar.
+- Реализован `OutboxProcessor`, который периодически (`@Scheduled`) считывает необработанные события из БД и отправляет их в Pulsar, гарантируя доставку "at-least-once".
 
-❌ Violation:
-SpecialOrder overrides calculateTotal() breaking discount contract.
+### 2. Acknowledgment & Dead-letter Topics
+- В `application.yml` настроен режим подтверждения `manual`.
+- В `OrderEventConsumer` добавлена логика обработки подтверждений:
+  - `acknowledgement.acknowledge()` вызывается при успешной обработке всеми хендлерами.
+  - `acknowledgement.nack()` вызывается при возникновении ошибок, что приводит к повторной доставке.
+- Настроена `dead-letter-policy`: после 3 неудачных попыток событие перемещается в топик `order-created-dlq`.
 
-Clients relying on base behavior break.
+### 3. Schema Evolution
+- В конфигурацию Pulsar добавлена стратегия `ALWAYS_COMPATIBLE` для управления эволюцией схем.
 
-✅ Fix:
-Separate abstractions.
-Use composition over inheritance.
-Keep invariants inside aggregate root.
+### 4. Tracing (Micrometer + OpenTelemetry)
+- В `pom.xml` добавлены зависимости для Micrometer Tracing и OpenTelemetry.
+- В `application.yml` включено сэмплирование трасс (100%) и настроен экспорт данных в формате OTLP.
 
----
+### 5. Обновление документации
+- `README.md` обновлен: раздел "рекомендуется" заменен на описание реализованной функциональности.
 
-# 4️⃣ ISP — Interface Segregation Principle
-
-Clients must not depend on methods they don’t use.
-
-❌ Violation:
-FatExternalClient with 12 methods.
-Services forced to implement unused ones.
-
-✅ Fix:
-Split into PaymentClient, ShippingClient, NotificationClient.
-
----
-
-# 5️⃣ DIP — Dependency Inversion Principle
-
-High-level modules must depend on abstractions.
-
-❌ Violation:
-OrderService directly creates RestClient.
-
-Hard to test.
-Hard to replace transport.
-
-✅ Fix:
-OrderService depends on PaymentPort.
-Adapter implements PaymentPort using RestClient.
-Test uses FakePaymentAdapter.
-
----
-
-# Architecture
-
-Hexagonal Architecture:
-- domain
-- application
-- ports
-- adapters
-- infrastructure
-
-OrderService = application layer
-PaymentPort = output port
-RestPaymentAdapter = adapter
-JpaOrderRepository = adapter
-
----
-
-# What Interviewers Expect at Senior Level
-
-- Ability to detect God Services
-- Explain transaction boundaries
-- Explain why DIP improves testability
-- Explain why inheritance breaks LSP
-- Know when NOT to apply SOLID blindly
-
----
-
-Run:
-mvn spring-boot:run
-
-
-2. Оба типа модулей должны зависеть от абстракций (интерфейсов/абстрактных классов).
-3. Абстракции не должны зависеть от деталей. Детали (конкретные реализации) должны зависеть от абстракций.
-   Классика — Dependency Injection (через конструктор, setter, интерфейс). Вместо new MySQLRepository() → Repository repo (интерфейс), который приходит извне. Это даёт гибкость, тестируемость и возможность менять реализации без изменения бизнес-логики.
+Все изменения соответствуют принципам SOLID и лучшим практикам построения событийно-ориентированных систем.

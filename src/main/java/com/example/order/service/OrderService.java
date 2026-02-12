@@ -1,8 +1,12 @@
 package com.example.order.service;
 
 import com.example.order.domain.OrderCreatedEvent;
-import com.example.order.producer.OrderEventProducer;
+import com.example.order.domain.OutboxEvent;
+import com.example.order.repository.OutboxRepository;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -11,12 +15,15 @@ import java.util.UUID;
 @Service
 public class OrderService {
 
-    private final OrderEventProducer eventProducer;
+    private final OutboxRepository outboxRepository;
+    private final ObjectMapper objectMapper;
 
-    public OrderService(OrderEventProducer eventProducer) {
-        this.eventProducer = eventProducer;
+    public OrderService(OutboxRepository outboxRepository, ObjectMapper objectMapper) {
+        this.outboxRepository = outboxRepository;
+        this.objectMapper = objectMapper;
     }
 
+    @Transactional
     public String createOrder(String customerId, String productId, int quantity, BigDecimal price) {
         String orderId = UUID.randomUUID().toString();
         BigDecimal total = price.multiply(BigDecimal.valueOf(quantity));
@@ -30,7 +37,14 @@ public class OrderService {
             Instant.now()
         );
 
-        eventProducer.publish(event);
+        try {
+            String payload = objectMapper.writeValueAsString(event);
+            OutboxEvent outboxEvent = new OutboxEvent("persistent://public/default/order-created", payload);
+            outboxRepository.save(outboxEvent);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException("Error serializing order event", e);
+        }
+
         return orderId;
     }
 }
