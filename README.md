@@ -19,20 +19,26 @@
 ### Структура проекта (упрощённо)
 
 ```
-src/main/java/com/example/order
-├── config
-│   └── PulsarConfig.java          (если нужно кастомизировать)
-├── domain
-│   └── OrderCreatedEvent.java
-├── service
-│   ├── OrderService.java
-│   └── handlers
-│       ├── OrderEventHandler.java       // интерфейс (DIP + OCP)
-│       ├── InventoryReservationHandler.java
-│       ├── PaymentInitiationHandler.java
-│       └── NotificationHandler.java
-└── producer
-    └── OrderEventProducer.java
+### Структура проекта (упрощённо)
+
+    src/main/java/com/example/order
+    ├── domain
+    │   ├── OrderCreatedEvent.java         // доменное событие
+    │   └── OutboxEvent.java               // JPA-сущность для transactional outbox
+    ├── producer
+    │   └── OrderEventProducer.java        // публикация событий в Pulsar
+    ├── repository
+    │   └── OutboxRepository.java          // Spring Data JPA репозиторий для outbox
+    ├── service
+    │   ├── handlers
+    │   │   ├── OrderEventHandler.java            // интерфейс (DIP + OCP)
+    │   │   ├── InventoryReservationHandler.java
+    │   │   ├── PaymentInitiationHandler.java
+    │   │   └── NotificationHandler.java
+    │   ├── OrderEventConsumer.java        // Pulsar consumer с manual ack и DLQ
+    │   ├── OrderService.java             // создание заказа + запись в outbox
+    │   └── OutboxProcessor.java          // @Scheduled: отправка событий из БД в Pulsar
+    └── OrderApplication.java             // точка входа Spring Boot
 ```
 
 ### Как это реализует принципы
@@ -55,7 +61,6 @@ src/main/java/com/example/order
 - **Transactional outbox**: события сначала сохраняются в БД (таблица `outbox_events`) в одной транзакции с бизнес-логикой, а затем отдельный процесс `OutboxProcessor` отправляет их в Pulsar.
 - **Acknowledgment**: настроен `MANUAL` режим подтверждения. Если хотя бы один обработчик завершается с ошибкой, вызывается `nack()`, что инициирует повторную доставку.
 - **Dead-letter topics**: после 3 неудачных попыток событие отправляется в `order-created-dlq`.
-- **Schema evolution**: настроена стратегия `ALWAYS_COMPATIBLE` для обеспечения совместимости схем при изменениях.
 - **Tracing**: интегрированы Micrometer Tracing и OpenTelemetry (настроено через `application.yml` и зависимости в `pom.xml`).
 
 В проект внесены следующие изменения для обеспечения надежности и наблюдаемости:
@@ -70,14 +75,33 @@ src/main/java/com/example/order
 - В `OrderEventConsumer` добавлена логика обработки подтверждений:
   - `acknowledgement.acknowledge()` вызывается при успешной обработке всеми хендлерами.
   - `acknowledgement.nack()` вызывается при возникновении ошибок, что приводит к повторной доставке.
-- Настроена `dead-letter-policy`: после 3 неудачных попыток событие перемещается в топик `order-created-dlq`.
+- Настроена `dead-letter-policy`: после 3 неудачных попыток событие перемещается в топик `order-created-dlq`.  
+  Стратегия совместимости (schema compatibility) — это правило, **разрешено ли менять схему сообщения так, чтобы новые и старые приложения могли продолжать общаться**.
 
-### 3. Schema Evolution
-- В конфигурацию Pulsar добавлена стратегия `ALWAYS_COMPATIBLE` для управления эволюцией схем.
+Проще:
+- **BACKWARD** — новые потребители должны уметь читать **старые** сообщения. (Вы добавляете поля с дефолтами и т.п.)
+- **FORWARD** — старые потребители должны уметь читать **новые** сообщения.
+- **FULL** — и backward, и forward одновременно.
+
+Это защищает от поломок при эволюции схемы: вы меняете структуру события, а брокер проверяет, **совместимо ли изменение** с уже зарегистрированными схемами.  
+если вы не задаёте стратегию совместимости, то используется дефолт брокера Pulsar. В большинстве установок это политика совместимости, заданная на уровне брокера/кластера (часто FULL, но зависит от конфигурации). В приложении Spring сама по себе ничего не включает — она лишь отправляет/читает схемы.
 
 ### 4. Tracing (Micrometer + OpenTelemetry)
 - В `pom.xml` добавлены зависимости для Micrometer Tracing и OpenTelemetry.
-- В `application.yml` включено сэмплирование трасс (100%) и настроен экспорт данных в формате OTLP.
+- В `application.yml` включено сэмплирование трасс (100%) и настроен экспорт данных в формате OTLP.  
+  Это означает, что **сэмплер трассировки настроен на 100%** — то есть **каждый запрос/операция будет трассироваться и отправляться в систему наблюдаемости** (например, в OpenTelemetry/OTLP).
+
+```yaml
+management:
+  tracing:
+    sampling:
+      probability: 1.0
+```
+- `1.0` → **все** трассы
+- `0.1` → **10%** трасс
+- `0.0` → **ничего не трассировать**
+
+В продакшене обычно ставят меньше, чтобы снизить нагрузку и объём данных.
 
 ### 5. Обновление документации
 - `README.md` обновлен: раздел "рекомендуется" заменен на описание реализованной функциональности.
