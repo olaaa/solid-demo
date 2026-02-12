@@ -1,0 +1,9 @@
+spring:
+  pulsar:
+    client:
+      service-url: pulsar://localhost:6650
+    defaults:
+      type-mappings:
+        - message-type: com.example.order.domain.OrderCreatedEvent
+          schema-info:
+            schema-type: JSON
